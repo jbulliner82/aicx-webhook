@@ -1,193 +1,243 @@
+// server.js
+// AICX Stripe webhook -> Google Sheets founder ledger
+
 require('dotenv').config();
-const fs = require('fs');
 const express = require('express');
-const bodyParser = require('body-parser');
-const stripeLib = require('stripe');
+const Stripe = require('stripe');
+const fs = require('fs');
 const { google } = require('googleapis');
 
 const app = express();
 
-// --- Stripe setup ---
-const stripe = stripeLib(process.env.STRIPE_SECRET_KEY);
-const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
+// ======== CONFIG ========
 
-// We need raw body for Stripe signature verification
-app.post(
-  '/stripe-webhook',
-  bodyParser.raw({ type: 'application/json' }),
-  async (req, res) => {
-    const sig = req.headers['stripe-signature'];
+const PORT = process.env.PORT || 8080;
+const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY;
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
 
-    let event;
-    try {
-      event = stripe.webhooks.constructEvent(
-        req.body,
-        sig,
-        endpointSecret
-      );
-    } catch (err) {
-      console.error('❌ Webhook signature verification failed:', err.message);
-      return res.status(400).send(`Webhook Error: ${err.message}`);
-    }
+const SPREADSHEET_ID = process.env.GOOGLE_SHEETS_SPREADSHEET_ID;
+const SHEET_NAME = process.env.GOOGLE_SHEETS_TAB_NAME || 'Sheet1';
 
-    // Handle the event
-    if (event.type === 'checkout.session.completed') {
-      const session = event.data.object;
-      console.log('✅ Checkout session completed:', session.id);
+// Version your legal doc here
+const AGREEMENT_VERSION = 'v1.0';
 
-      try {
-        await handleCheckoutCompleted(session);
-        res.status(200).send('Received and processed');
-      } catch (err) {
-        console.error('❌ Error handling checkout completion:', err);
-        res.status(500).send('Server error');
-      }
-    } else {
-      // Ignore other events for now
-      res.status(200).send('Event ignored');
-    }
-  }
-);
+// Stripe client
+if (!STRIPE_SECRET_KEY) {
+  console.error('❌ STRIPE_SECRET_KEY is not set in environment');
+  process.exit(1);
+}
+const stripe = new Stripe(STRIPE_SECRET_KEY, {
+  // apiVersion: '2024-06-20', // optional; you can pin a version if you want
+});
 
-// --- Map Stripe price IDs to tiers & credits ---
-// TODO: replace these with your actual Stripe price IDs
-const TIER_CONFIG = {
-  'price_1SWcyzHeOH2hxFO3a1RWyyv1': {
-    tier: 'Bronze',
-    contribution: 250,
-    credits: 325
-  },
-  'price_1SWd8MHeOH2hxFO3PycEn43V': {
-    tier: 'Silver',
-    contribution: 750,
-    credits: 1050
-  },
-  'price_1SWdDaHeOH2hxFO31X6W21AK': {
-    tier: 'Gold',
-    contribution: 2000,
-    credits: 3000
-  },
-  'price_1SWdGPHeOH2hxFO3ZsLDEvhK': {
-    tier: 'Titan',
-    contribution: 5000,
-    credits: 8000
-  }
-};
+// ======== GOOGLE SHEETS AUTH ========
 
-// --- Google Sheets client setup ---
 let sheetsCredentials;
 
-// Prefer env var, fall back to file for local dev
+// Prefer env var with full JSON; fallback to local file for dev
 if (process.env.GOOGLE_SERVICE_ACCOUNT_KEY) {
-  sheetsCredentials = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_KEY);
+  try {
+    sheetsCredentials = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_KEY);
+  } catch (err) {
+    console.error('❌ Failed to parse GOOGLE_SERVICE_ACCOUNT_KEY JSON:', err);
+    process.exit(1);
+  }
 } else {
-  sheetsCredentials = JSON.parse(
-    fs.readFileSync(process.env.GOOGLE_SERVICE_ACCOUNT_KEY_JSON || './service-account.json', 'utf8')
-  );
+  const jsonPath = process.env.GOOGLE_SERVICE_ACCOUNT_KEY_JSON || './service-account.json';
+  try {
+    const raw = fs.readFileSync(jsonPath, 'utf8');
+    sheetsCredentials = JSON.parse(raw);
+  } catch (err) {
+    console.error('❌ Failed to load service account JSON from file:', err);
+    process.exit(1);
+  }
 }
 
 const auth = new google.auth.GoogleAuth({
   credentials: sheetsCredentials,
-  scopes: ['https://www.googleapis.com/auth/spreadsheets']
+  scopes: ['https://www.googleapis.com/auth/spreadsheets'],
 });
 
 const sheetsClient = google.sheets({ version: 'v4', auth });
 
-// --- Handler for completed checkout sessions ---
-async function handleCheckoutCompleted(session) {
-  // Fetch line items to get price ID
-  const lineItems = await stripe.checkout.sessions.listLineItems(
-    session.id,
-    { limit: 10 }
-  );
+// ======== EXPRESS MIDDLEWARE ========
 
-  if (!lineItems.data || lineItems.data.length === 0) {
-    throw new Error('No line items found on session');
+// Stripe requires the raw body to verify signatures
+app.use('/stripe-webhook', express.raw({ type: 'application/json' }));
+
+// For any future JSON endpoints
+app.use(express.json());
+
+// Simple healthcheck
+app.get('/', (_req, res) => {
+  res.send('AICX Stripe webhook is live.');
+});
+
+// ======== HELPER: TIER & CREDITS LOGIC ========
+
+// Try to resolve tier from metadata or amount
+function resolveTier(session) {
+  if (session.metadata && session.metadata.tier) {
+    return session.metadata.tier;
   }
 
-  const firstItem = lineItems.data[0];
-  const priceId = firstItem.price.id;
+  const amountTotal = (session.amount_total || 0) / 100; // Stripe uses cents
 
-  const config = TIER_CONFIG[priceId];
-  if (!config) {
-    throw new Error(`Unknown price ID: ${priceId}`);
-  }
-
-  const email = session.customer_details?.email || session.customer_email || 'unknown';
-  const amountTotal = session.amount_total / 100; // in USD
-  const timestamp = new Date().toISOString();
-  const tier = config.tier;
-  const credits = config.credits;
-  const sessionId = session.id;
-  const customerId = session.customer || '';
-
-  console.log('📝 Logging founder:', {
-    timestamp,
-    email,
-    tier,
-    amountTotal,
-    credits,
-    sessionId,
-    customerId
-  });
-
-  await appendToSheet({
-    timestamp,
-    email,
-    tier,
-    amountTotal,
-    credits,
-    sessionId,
-    customerId
-  });
+  if (amountTotal >= 5000) return 'Titan';
+  if (amountTotal >= 2000) return 'Gold';
+  if (amountTotal >= 750) return 'Silver';
+  if (amountTotal >= 250) return 'Bronze';
+  return 'Unknown';
 }
 
-// Append a row to Google Sheets
-async function appendToSheet({
-  timestamp,
-  email,
-  tier,
-  amountTotal,
-  credits,
-  sessionId,
-  customerId
-}) {
-  const spreadsheetId = process.env.GOOGLE_SHEETS_SPREADSHEET_ID;
-  const tabName = process.env.GOOGLE_SHEETS_TAB_NAME || 'Sheet1';
-  const range = `${tabName}!A:H`;
+// Map known amounts to credits; fallback to multiplier
+function resolveCredits(tier, amountTotal) {
+  // amountTotal is in USD (not cents)
+  const rounded = Math.round(amountTotal);
 
-  const values = [
-    [
-      timestamp,
+  switch (rounded) {
+    case 250:
+      return 325;   // Bronze
+    case 750:
+      return 1050;  // Silver
+    case 2000:
+      return 3000;  // Gold
+    case 5000:
+      return 8000;  // Titan
+    default:
+      // Fallback: 1.3x multiplier if something odd comes through
+      return Math.round(amountTotal * 1.3);
+  }
+}
+
+// ======== GOOGLE SHEETS APPEND ========
+
+async function appendToSheet(founder) {
+  // Sheet layout:
+  // A: Timestamp UTC
+  // B: Local Time
+  // C: Email
+  // D: Tier
+  // E: AmountPaidUSD
+  // F: Credits
+  // G: Session ID
+  // H: Customer ID
+  // I: Notes
+  // J: Status (manual; leave blank)
+  // K: Agreement Version
+
+  const row = [
+    founder.timestampUtc,         // A
+    founder.timestampLocal,       // B
+    founder.email || '',          // C
+    founder.tier || '',           // D
+    founder.amountTotal || 0,     // E
+    founder.credits || 0,         // F
+    founder.sessionId || '',      // G
+    founder.customerId || '',     // H
+    founder.notes || '',          // I
+    '',                           // J (Status left blank; you manage manually)
+    founder.agreementVersion || ''// K
+  ];
+
+  console.log('📝 Appending row to Sheet:', row);
+
+  await sheetsClient.spreadsheets.values.append({
+    spreadsheetId: SPREADSHEET_ID,
+    range: `${SHEET_NAME}!A:K`,
+    valueInputOption: 'USER_ENTERED',
+    requestBody: {
+      values: [row],
+    },
+  });
+
+  console.log('✅ Successfully appended founder to Google Sheet');
+}
+
+// ======== STRIPE WEBHOOK HANDLER ========
+
+async function handleCheckoutCompleted(session) {
+  try {
+    const email =
+      (session.customer_details && session.customer_details.email) ||
+      session.customer_email ||
+      '';
+
+    const amountTotal = (session.amount_total || 0) / 100; // cents -> USD
+    const tier = resolveTier(session);
+    const credits = resolveCredits(tier, amountTotal);
+
+    const now = new Date();
+    const timestampUtc = now.toISOString();
+    const timestampLocal = now.toLocaleString('en-US', {
+      timeZone: 'America/Chicago',
+    });
+
+    const founderRecord = {
+      timestampUtc,
+      timestampLocal,
       email,
       tier,
       amountTotal,
       credits,
-      sessionId,
-      customerId,
-      ''
-    ]
-  ];
+      sessionId: session.id,
+      customerId: session.customer || '',
+      notes: '',
+      agreementVersion: AGREEMENT_VERSION,
+    };
 
-  const resource = {
-    values
-  };
+    console.log('✅ Checkout session completed:', session.id);
+    console.log('📝 Logging founder:', founderRecord);
 
-  const res = await sheetsClient.spreadsheets.values.append({
-    spreadsheetId,
-    range,
-    valueInputOption: 'USER_ENTERED',
-    resource
-  });
-
-  console.log('✅ Appended to sheet:', res.data.updates?.updatedRange);
+    await appendToSheet(founderRecord);
+  } catch (err) {
+    console.error('❌ Error handling checkout completion:', err);
+    throw err;
+  }
 }
 
-app.get('/', (req, res) => {
-  res.send('AICX Stripe webhook is live.');
+app.post('/stripe-webhook', async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+
+  let event;
+
+  if (!STRIPE_WEBHOOK_SECRET) {
+    console.error('❌ STRIPE_WEBHOOK_SECRET is not set');
+    return res.status(500).send('Webhook secret not configured');
+  }
+
+  try {
+    event = stripe.webhooks.constructEvent(
+      req.body,
+      sig,
+      STRIPE_WEBHOOK_SECRET
+    );
+  } catch (err) {
+    console.error('❌ Error verifying Stripe webhook signature:', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  try {
+    switch (event.type) {
+      case 'checkout.session.completed': {
+        const session = event.data.object;
+        await handleCheckoutCompleted(session);
+        break;
+      }
+      default:
+        // Ignore events we don't care about
+        console.log(`ℹ️ Ignoring event type: ${event.type}`);
+    }
+
+    res.json({ received: true });
+  } catch (err) {
+    console.error('❌ Error processing webhook event:', err);
+    res.status(500).send('Internal Server Error');
+  }
 });
 
-const port = process.env.PORT || 8080;
-app.listen(port, () => {
-  console.log(`🚀 AICX webhook server listening on port ${port}`);
+// ======== START SERVER ========
+
+app.listen(PORT, () => {
+  console.log(`🚀 AICX Stripe webhook server listening on port ${PORT}`);
 });
